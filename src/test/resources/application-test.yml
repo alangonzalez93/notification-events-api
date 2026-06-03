@@ -1,0 +1,9 @@
+spring:
+  datasource:
+    url: jdbc:mysql://localhost/test
+    username: test
+    password: test
+  jpa:
+    show-sql: true
+  flyway:
+    enabled: true

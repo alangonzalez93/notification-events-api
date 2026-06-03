@@ -8,11 +8,13 @@
 | Framework | Spring Boot 3.x | Required by challenge; native support for Actuator, JPA, WebClient |
 | Build tool | Maven | Required by challenge; standard in enterprise Java |
 | ORM | Spring Data JPA + Hibernate | Standard Spring persistence stack |
-| Database | MySQL 8 | Required by challenge; production-grade RDBMS |
+| Database | MySQL 8.0 | Required by challenge; production-grade RDBMS |
 | Migrations | Flyway | Versioned, auditable schema changes; integrates natively with Spring Boot |
 | Containerization | Docker + Docker Compose | One-command startup for evaluators |
 | Observability | Spring Boot Actuator | Health checks and metrics out of the box |
 | Testing | JUnit 5 + Testcontainers | Real MySQL in tests — no mocking the database |
+| Boilerplate | Lombok | Eliminates getter/setter/constructor noise from JPA entities |
+| Mapping | MapStruct | Compile-time type-safe mapper generation — zero reflection, fast, IDE-friendly |
 
 ---
 
@@ -78,7 +80,6 @@ src/main/java/com/cobre/notifications/
 
 src/main/resources/
 ├── application.yml
-├── application-local.yml                      ← local overrides (gitignored)
 └── db/migration/
     └── V1__create_clients.sql
 
@@ -163,6 +164,7 @@ public interface ClientRepository {
     Optional<Client> findByUniqueCode(String uniqueCode);
     Optional<Client> findByEmail(String email);
     List<Client> findAllActive();
+    void softDelete(String uniqueCode);
 }
 ```
 
@@ -174,6 +176,7 @@ public interface ClientRepository {
 
 ```java
 @Entity
+@SQLRestriction("deleted = false")   // Hibernate 6 — auto-applies to every generated query
 @Table(
     name = "clients",
     indexes = {
@@ -191,20 +194,33 @@ public class ClientJpaEntity extends BaseEntity {
 }
 ```
 
-**`infrastructure.persistence.mapper.ClientMapper`**:
+**Why `@SQLRestriction` instead of `AndDeletedFalse` query suffixes:**
+A single annotation on the entity guarantees the soft-delete filter is applied everywhere — `findAll()`, `findBy*`, custom JPQL, even `findById()`. There is no risk of a developer accidentally querying deleted records by forgetting to add the filter suffix.
+
+**`infrastructure.persistence.mapper.ClientMapper`** — MapStruct interface (compile-time generated):
 
 ```java
-@Component
-public class ClientMapper {
-    public Client toDomain(ClientJpaEntity entity) { ... }
-    public ClientJpaEntity toEntity(Client domain) { ... }
+@Mapper(componentModel = "spring")
+public interface ClientMapper {
+    Client toDomain(ClientJpaEntity entity);
+
+    @Mapping(target = "id", ignore = true)
+    @Mapping(target = "uniqueCode", ignore = true)
+    @Mapping(target = "deleted", ignore = true)
+    @Mapping(target = "createdDate", ignore = true)
+    @Mapping(target = "lastModifiedDate", ignore = true)
+    ClientJpaEntity toEntity(Client domain);
 }
 ```
+
+**Why MapStruct over manual mapper:**
+MapStruct generates the implementation at compile time — type-safe, zero reflection, IDE-navigable. A manual `@Component` mapper is error-prone and verbose. MapStruct also catches mapping mismatches as compile errors, not runtime NPEs.
 
 **`infrastructure.persistence.repository.ClientJpaRepository`** — Spring Data + port adapter:
 
 ```java
 @Repository
+@RequiredArgsConstructor
 public class ClientJpaRepository implements ClientRepository {
 
     private final ClientSpringDataRepository springDataRepository;
@@ -213,10 +229,11 @@ public class ClientJpaRepository implements ClientRepository {
     // delegates to Spring Data, maps entity ↔ domain
 }
 
+// package-private — not part of the public API
 interface ClientSpringDataRepository extends JpaRepository<ClientJpaEntity, Long> {
-    Optional<ClientJpaEntity> findByUniqueCodeAndDeletedFalse(String uniqueCode);
-    Optional<ClientJpaEntity> findByEmailAndDeletedFalse(String email);
-    List<ClientJpaEntity> findAllByDeletedFalse();
+    Optional<ClientJpaEntity> findByUniqueCode(String uniqueCode);
+    Optional<ClientJpaEntity> findByEmail(String email);
+    // findAll() inherited — @SQLRestriction handles deleted=false automatically
 }
 ```
 
@@ -328,11 +345,14 @@ Stage 2 — runtime:
 
 ```bash
 # Database
-DB_URL=jdbc:mysql://mysql:3306/notification_events_db?useSSL=false&allowPublicKeyRetrieval=true
+DB_URL=jdbc:mysql://mysql:3306/notification_events_api?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
 DB_USERNAME=cobre
 DB_PASSWORD=cobre_pass
 DB_ROOT_PASSWORD=root_pass
-DB_NAME=notification_events_db
+DB_NAME=notification_events_api
+
+# App
+LOG_LEVEL=INFO
 ```
 
 ---
@@ -341,19 +361,22 @@ DB_NAME=notification_events_db
 
 ### Testcontainers setup
 
-A shared `@SpringBootTest` base class spins up a single MySQL container for the entire test suite (reused across tests via `@Container` + `static`). Each test runs in a transaction that is rolled back after the test via `@Transactional`.
+A shared `@SpringBootTest` base class spins up a single MySQL container for the entire test suite (reused across tests via `@Container` + `static`). `@Transactional` is declared on each test subclass so the rollback scope is explicit per test class.
 
 ```java
-@SpringBootTest
+@SpringBootTest(webEnvironment = NONE)
 @Testcontainers
-@Transactional
+@ActiveProfiles("test")
 public abstract class IntegrationTestBase {
 
     @Container
-    static MySQLContainer<?> mysql = new MySQLContainer<>("mysql:8")
-            .withDatabaseName("test_db")
+    static MySQLContainer<?> mysql = new MySQLContainer<>("mysql:8.0")
+            .withDatabaseName("notification_events_api_test")
             .withUsername("test")
-            .withPassword("test");
+            .withPassword("test")
+            .withStartupTimeoutSeconds(300)
+            .withConnectTimeoutSeconds(300)
+            .withCommand("--innodb-buffer-pool-size=32M", "--skip-name-resolve", "--character-set-server=utf8mb4");
 
     @DynamicPropertySource
     static void configureProperties(DynamicPropertyRegistry registry) {
@@ -361,8 +384,13 @@ public abstract class IntegrationTestBase {
         registry.add("spring.datasource.username", mysql::getUsername);
         registry.add("spring.datasource.password", mysql::getPassword);
     }
+
+    @Autowired
+    protected EntityManager entityManager;
 }
 ```
+
+**Why `--innodb-buffer-pool-size=32M`:** MySQL 8.0 defaults to a 128 MB InnoDB buffer pool which causes 60–120 s initialization in Docker Desktop. Reducing it to 32 MB cuts startup to ~15 s with no functional impact for tests.
 
 ### ClientJpaRepository integration tests
 
