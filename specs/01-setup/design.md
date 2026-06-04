@@ -113,21 +113,21 @@ public abstract class BaseEntity {
     private Boolean deleted = false;
 
     @Column(name = "created_date", nullable = false, updatable = false)
-    private LocalDateTime createdDate;
+    private OffsetDateTime createdDate;
 
     @Column(name = "last_modified_date", nullable = false)
-    private LocalDateTime lastModifiedDate;
+    private OffsetDateTime lastModifiedDate;
 
     @PrePersist
     void prePersist() {
         if (uniqueCode == null) uniqueCode = UUID.randomUUID().toString();
-        createdDate = LocalDateTime.now();
-        lastModifiedDate = LocalDateTime.now();
+        createdDate = OffsetDateTime.now(ZoneOffset.UTC);
+        lastModifiedDate = OffsetDateTime.now(ZoneOffset.UTC);
     }
 
     @PreUpdate
     void preUpdate() {
-        lastModifiedDate = LocalDateTime.now();
+        lastModifiedDate = OffsetDateTime.now(ZoneOffset.UTC);
     }
 }
 ```
@@ -151,8 +151,8 @@ public record Client(
     String name,
     String email,
     Boolean deleted,
-    LocalDateTime createdDate,
-    LocalDateTime lastModifiedDate
+    OffsetDateTime createdDate,
+    OffsetDateTime lastModifiedDate
 ) {}
 ```
 
