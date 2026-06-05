@@ -28,17 +28,52 @@ spring:
     enabled: true
     locations: classpath:db/migration
 
+  lifecycle:
+    timeout-per-shutdown-phase: 30s
+
 server:
   port: 8080
+  servlet:
+    context-path: /api
+  shutdown: graceful
+
+notifications:
+  dispatcher:
+    delay-ms: 5000
+    batch-size: 100
+    processing-timeout-minutes: 5
+  retry:
+    max-attempts: 4
+    base-delay-seconds: 5
+    max-delay-seconds: 60
+    jitter-factor: 0.2
+  webhook:
+    connect-timeout-ms: 5000
+    read-timeout-ms: 10000
+  async:
+    core-pool-size: 10
+    max-pool-size: 50
+    queue-capacity: 500
+  circuitbreaker:
+    sliding-window-size: 5
+    minimum-number-of-calls: 10
+    failure-rate-threshold: 50
+    wait-duration-seconds: 30
+    permitted-calls-in-half-open: 2
 
 management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,metrics,prometheus
   endpoint:
     health:
       show-details: always
+    env:
+      enabled: false
+  server:
+    port: 8081
+    # address: 127.0.0.1  ← en producción descomentar para restringir a red interna
 
 logging:
   level:
@@ -46,5 +81,3 @@ logging:
     com.cobre.notifications: DEBUG
     org.hibernate.SQL: WARN
     org.flywaydb: INFO
-  pattern:
-    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %-40logger{40} - %msg%n"

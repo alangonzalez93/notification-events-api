@@ -71,7 +71,8 @@ to deliver notifications and which event types I want to receive.
 - `PUT /clients/{clientUniqueCode}/subscriptions/{subscriptionUniqueCode}` — updates `webhookUrl`,
   `authHeaderName`, `authHeaderValue`, `eventTypes`, and/or `active`. Returns 200.
 - `DELETE /clients/{clientUniqueCode}/subscriptions/{subscriptionUniqueCode}` — soft-deletes the
-  subscription. Returns 204.
+  subscription. Returns 204. All `PENDING` notifications for that subscription are immediately
+  marked `FAILED` with `lastError = "Subscription deleted"` in the same transaction.
 - `WHEN subscriptionUniqueCode does not belong to the given clientUniqueCode`,
   THEN return 403 Forbidden.
 
@@ -83,7 +84,7 @@ to deliver notifications and which event types I want to receive.
 them against subscriptions and create notifications accordingly.
 
 **Acceptance Criteria:**
-- `POST /platform-events/ingest` shall accept: `eventId`, `eventType`, `payload`, `clientUniqueCode`.
+- `POST /platform-events` shall accept: `eventId`, `eventType`, `payload`, `clientUniqueCode`.
 - `WHEN the client has an active subscription that includes the event's eventType`,
   THEN the system shall create a `NotificationEvent` with `deliveryStatus = PENDING`
   linked to that subscription, and return **201 Created**.
@@ -94,21 +95,14 @@ them against subscriptions and create notifications accordingly.
 - `WHEN the same eventId + clientUniqueCode is received again`, THEN return 409 Conflict
   (idempotency guard at the platform event level).
 
-**US-3.2** — As a developer, I want to bulk-ingest events from a JSON payload so I can seed
-realistic data for demos without calling the ingest endpoint individually.
+**US-3.2** — ~~As a developer, I want to bulk-ingest events from a JSON payload so I can seed
+realistic data for demos without calling the ingest endpoint individually.~~
 
-**Acceptance Criteria:**
-- `POST /platform-events` shall accept a JSON body with an `events` array in the exact
-  format of `notification_events.json`: each item containing `event_id`, `event_type`, `content`,
-  `delivery_date`, `delivery_status` (`"completed"` or `"failed"`), and `client_id`.
-- Each event SHALL be created with the delivery status as provided in the payload —
-  `"completed"` maps to `DELIVERED` (with `deliveredAt = delivery_date`),
-  `"failed"` maps to `FAILED`. This bypasses the delivery pipeline intentionally.
-- The system SHALL resolve `subscription_id` by looking up any active subscription for
-  the given `client_id`. If no active subscription exists for that client, the event is discarded.
-- Duplicate `event_id` + `client_id` combinations SHALL be skipped silently.
-- `WHEN clientId does not exist`, the event SHALL be discarded (not an error).
-- The endpoint shall return 200: `{ "created": N, "discarded": N }`.
+> **Decisión de implementación:** el bulk seed vía HTTP fue eliminado. Los datos de demo se cargan
+> directamente en la base de datos con `scripts/seed_data.sql` (`docker compose exec mysql ...`).
+> En producción, los eventos llegarían por SQS/Kafka — no existe un caso de uso legítimo para
+> cargar eventos históricos con status pre-asignado vía HTTP. El endpoint HTTP habría sido
+> un riesgo de seguridad en producción.
 
 ---
 
@@ -132,8 +126,8 @@ notifications and sends them to the corresponding webhooks.
 the client's configured authentication.
 
 **Acceptance Criteria:**
-- Each `PROCESSING` notification SHALL be dispatched to an async worker using non-blocking
-  HTTP via `WebClient`.
+- Each `PROCESSING` notification SHALL be dispatched to an async worker (`@Async` thread pool)
+  that makes a blocking HTTP POST via `RestClient`.
 - The system SHALL fetch the subscription at delivery time to get the current `webhookUrl`,
   `authHeaderName`, and `authHeaderValue`.
   - `WHEN the linked subscription is inactive or deleted at delivery time`,

@@ -21,6 +21,7 @@ services:
     build: .
     ports:
       - "8080:8080"
+      - "8081:8081"
     environment:
       DB_URL: jdbc:mysql://mysql:3306/${DB_NAME}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
       DB_USERNAME: ${DB_USERNAME}

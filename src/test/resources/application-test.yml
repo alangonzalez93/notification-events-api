@@ -7,3 +7,32 @@ spring:
     show-sql: true
   flyway:
     enabled: true
+
+# Disable scheduler in tests — tests trigger delivery manually
+notifications:
+  dispatcher:
+    delay-ms: 3600000
+    batch-size: 10
+    processing-timeout-minutes: 5
+  retry:
+    max-attempts: 3
+    base-delay-seconds: 5
+    max-delay-seconds: 60
+    jitter-factor: 0.2
+  webhook:
+    connect-timeout-ms: 3000
+    read-timeout-ms: 5000
+  async:
+    core-pool-size: 2
+    max-pool-size: 5
+    queue-capacity: 50
+  circuitbreaker:
+    sliding-window-size: 5
+    minimum-number-of-calls: 10
+    failure-rate-threshold: 50
+    wait-duration-seconds: 30
+    permitted-calls-in-half-open: 2
+
+management:
+  server:
+    port: 0        # random port in tests — avoids management.server.address conflict

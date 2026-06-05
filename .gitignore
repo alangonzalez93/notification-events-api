@@ -48,3 +48,6 @@ CHALLENGE.md
 CLAUDE.md
 notification_events.json
 *.pdf
+
+# Local test scripts
+scripts/smoke_test.py

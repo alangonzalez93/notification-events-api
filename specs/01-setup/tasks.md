@@ -57,8 +57,8 @@ Each task references the requirement it satisfies. Tasks marked with `[P]` withi
 
 > Prerequisito: Phases 4 y 5 completas.
 
-- [ ] **6.1** Ejecutar `docker compose up` y verificar que MySQL y API levantan sin errores
-- [ ] **6.2** Verificar que Flyway corre las migraciones automáticamente al iniciar la API
-- [ ] **6.3** Verificar `GET /actuator/health` retorna 200 con MySQL conectado
-- [ ] **6.4** Ejecutar `mvn test` y verificar que los tres tests de `ClientJpaRepositoryTest` pasan
-- [ ] **6.5** Verificar que `CHALLENGE.md`, `CLAUDE.md`, `notification_events.json` y archivos `.pdf` no aparecen en `git status`
+- [x] **6.1** Ejecutar `docker compose up` y verificar que MySQL y API levantan sin errores
+- [x] **6.2** Verificar que Flyway corre las migraciones automáticamente al iniciar la API
+- [x] **6.3** Verificar `GET /actuator/health` retorna 200 con MySQL conectado
+- [x] **6.4** Ejecutar `mvn test` y verificar que los tres tests de `ClientJpaRepositoryTest` pasan
+- [x] **6.5** Verificar que `CHALLENGE.md`, `CLAUDE.md`, `notification_events.json` y archivos `.pdf` no aparecen en `git status`

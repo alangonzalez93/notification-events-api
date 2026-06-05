@@ -1,239 +1,150 @@
-# Security Analysis — OWASP API Top 10
+# Security Analysis — OWASP API Security Top 10
 
-Three vulnerabilities relevant to the Notification Events API, with mitigations implemented in code and configuration.
+Three vulnerabilities applicable to this API, with their attack scenarios and proposed mitigations.
 
 ---
 
-## Vulnerability 1 — API1:2023 Broken Object Level Authorization (BOLA)
+## API1:2023 — Broken Object Level Authorization (BOLA)
 
-### Description
+### Why this applies
 
-The self-service API exposes `/api/notification_events` and `/api/notification_events/{id}`. Without proper authorization checks, **Client A could query or replay Client B's notifications** simply by knowing or guessing a notification's `uniqueCode`.
+The self-service API exposes resources by identifier:
+
+```
+GET  /api/notification_events/{uniqueCode}
+POST /api/notification_events/{uniqueCode}/replay
+```
+
+`uniqueCode` values are UUIDs — non-sequential but not secret. A client that knows or guesses a `uniqueCode` belonging to another client can read that client's notification payload or trigger an unwanted replay, because the current implementation has no ownership check beyond the identifier itself.
 
 ### Attack scenario
 
 ```
-# Attacker is authenticated as CLIENT001
-# Guesses or enumerates a uniqueCode belonging to CLIENT002
+# Attacker authenticates as CLIENT-A
+# Obtains a uniqueCode belonging to CLIENT-B (e.g. from a support ticket, log leak, or enumeration)
 
-GET /api/notification_events/a3f9b2c1-...
-→ 200 OK  { "client_id": "CLIENT002", "payload": "Transfer $50,000 to account #9876" }
+GET /api/notification_events/b7f3a1c9-...
+→ 200 OK { "clientUniqueCode": "CLIENT-B", "payload": "Transfer $50,000 to account #9876" }
 
-POST /api/notification_events/a3f9b2c1-.../replay
-→ 202 Accepted  ← triggers unwanted re-delivery to CLIENT002's webhook
+POST /api/notification_events/b7f3a1c9-.../replay
+→ 202 Accepted   ← triggers an unintended re-delivery to CLIENT-B's webhook
 ```
 
-This is the **#1 API vulnerability** according to OWASP because APIs expose object IDs by design, and developers often forget to enforce ownership checks beyond authentication.
+### Proposed mitigation
 
-### Mitigation
+Every endpoint that returns or mutates a `NotificationEvent` must validate that the resource belongs to the authenticated caller before returning a response. The authenticated identity must come from the security context — never from a query parameter or request body that the caller controls.
 
-Every query and mutation is scoped by `clientUniqueCode`, extracted from the authenticated context (not from the request body):
-
-```java
-// NotificationEventController
-@GetMapping("/{code}")
-public ResponseEntity<NotificationEventDetailResponse> getOne(
-        @PathVariable String code,
-        @AuthenticatedClient String authenticatedClientCode) {  // from security context
-
-    NotificationEvent event = getUseCase.getByUniqueCode(code);
-
-    if (!event.clientUniqueCode().equals(authenticatedClientCode)) {
-        throw new ForbiddenException("Access denied");  // → HTTP 403
-    }
-    return ResponseEntity.ok(mapper.toDetailResponse(event));
+```
+if (!event.clientUniqueCode().equals(authenticatedClientCode)) {
+    throw ForbiddenException → HTTP 403
 }
 ```
 
-The `GET /api/notification_events` list endpoint accepts `clientUniqueCode` as a query parameter but **ignores it** — the authenticated client code from the security context is always used as the filter:
-
-```java
-// GetNotificationEventsUseCaseImpl
-PageResult<NotificationEvent> result = repository.findByClientUniqueCode(
-    authenticatedClientCode,  // ← always from security context, never from user input
-    filters.deliveryStatus(), filters.from(), filters.to(),
-    filters.page(), filters.size()
-);
-```
+For the list endpoint (`GET /notification_events`), any `clientUniqueCode` supplied as a query parameter must be ignored; the query must be scoped exclusively to the authenticated client's code.
 
 ---
 
-## Vulnerability 2 — API2:2023 Broken Authentication
+## API2:2023 — Broken Authentication
 
-### Description
+### Why this applies
 
-Without authentication, all endpoints are publicly accessible. An unauthenticated attacker could:
-
-- Read all notification events for any client (data breach)
-- Trigger replays for any client (operational disruption)
-- Ingest arbitrary platform events (data poisoning)
+The application has no authentication layer configured. Every endpoint — including `POST /api/platform-events/ingest` — is reachable without credentials. Spring Boot's default, without `spring-boot-starter-security` on the classpath and a `SecurityFilterChain` configured, is to either require HTTP Basic with a random password (dev mode) or allow all requests depending on the version and configuration.
 
 ### Attack scenario
 
 ```
 # No credentials required
-GET /api/notification_events?clientUniqueCode=CLIENT001
-→ 200 OK  [full list of CLIENT001's transactions]
+GET /api/notification_events?deliveryStatus=DELIVERED
+→ 200 OK  [full list of all clients' transactions]
 
 POST /api/platform-events/ingest
-{ "eventId": "FAKE001", "eventType": "credit_deposit", "clientUniqueCode": "CLIENT001", "payload": "Fraudulent deposit" }
-→ 201 Created
+{ "eventId": "FAKE-001", "clientUniqueCode": "CLIENT-B", "payload": "Fraudulent credit" }
+→ 201 Created   ← arbitrary data injected into the pipeline
 ```
 
-### Mitigation
+### Proposed mitigation
 
-Spring Security configuration with two distinct protection zones:
+Add `spring-boot-starter-security` and configure a `SecurityFilterChain` with stateless session policy and two distinct protection zones:
 
-```java
-@Configuration
-@EnableWebSecurity
-public class SecurityConfig {
-
-    @Bean
-    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
-        http
-            .csrf(AbstractHttpConfigurer::disable)           // REST API — no session
-            .sessionManagement(s -> s.sessionCreationPolicy(STATELESS))
-            .authorizeHttpRequests(auth -> auth
-                // Public: health check and API docs only
-                .requestMatchers(
-                    "/actuator/health",
-                    "/swagger-ui/**",
-                    "/v3/api-docs/**"
-                ).permitAll()
-                // Internal: platform event ingestion requires service-to-service token
-                .requestMatchers("/api/platform-events/**").hasRole("PLATFORM")
-                // Client-facing: self-service API requires client authentication
-                .anyRequest().authenticated()
-            )
-            .httpBasic(Customizer.withDefaults());           // replace with JWT/OAuth2 in prod
-        return http.build();
-    }
-}
-```
-
-**Authentication per zone:**
-
-| Zone | Consumers | Auth mechanism |
+| Zone | Consumers | Mechanism |
 |---|---|---|
-| `/api/platform-events/**` | Cobre Platform (internal) | Bearer token / API key with `ROLE_PLATFORM` |
-| `/api/notification_events/**` | Cobre Clients (external) | Bearer token / API key with `ROLE_CLIENT` |
-| `/actuator/health` | Load balancer, monitoring | Public (health only, no sensitive data) |
-| `/actuator/**` (all others) | Ops team | Restricted to internal network or `ROLE_OPS` |
+| `POST /api/platform-events/**` | Cobre Platform (internal service) | API key or mTLS with `ROLE_PLATFORM` |
+| `GET/POST /api/notification_events/**` | Cobre Clients (external) | Bearer token / OAuth2 with `ROLE_CLIENT` |
+| `GET /actuator/health` | Load balancer, uptime monitors | Public |
+| `GET /actuator/**` (all others) | Ops team only | `ROLE_OPS` or internal network restriction |
 
-> **Note for this challenge**: basic auth is used for simplicity. Production would use OAuth2 / JWT with short-lived tokens and a proper identity provider.
+For this challenge, HTTP Basic with hardcoded roles is sufficient as a demo; production would require OAuth2 / JWT with short-lived tokens issued by an identity provider (Keycloak, Auth0, etc.).
 
 ---
 
-## Vulnerability 3 — API8:2023 Security Misconfiguration — Actuator Endpoints Exposed
+## API8:2023 — Security Misconfiguration
 
-### Description
+### Why this applies
 
-Spring Boot Actuator exposes operational endpoints: `/actuator/env`, `/actuator/beans`, `/actuator/heapdump`, `/actuator/loggers`, `/actuator/metrics`. If exposed without restriction, attackers gain:
+Spring Boot Actuator is enabled. The current `application.yml` already whitelists the exposed endpoints (`health, info, metrics, prometheus`) and disables `/actuator/env`, which is the right direction. However two gaps remain:
 
-- **`/actuator/env`**: all environment variables including DB credentials, API keys, and webhook auth values
-- **`/actuator/heapdump`**: a full JVM heap dump — can be parsed offline to extract plaintext secrets from memory
-- **`/actuator/beans`**: full Spring application context — useful for mapping attack surface
+1. `management.endpoint.health.show-details: always` — the health endpoint reveals internal component details (DB connection pool state, disk space, custom health indicators) to anyone that can reach management port 8081, with no authentication required.
+2. `management.server.address` is commented out — in production, port 8081 should be bound to `127.0.0.1` or a private VPC interface so it is never reachable from the public internet.
 
 ### Attack scenario
 
 ```
-# No auth required in a misconfigured app
-GET /actuator/env
+# Attacker reaches management port directly (e.g. misconfigured load balancer, SSRF)
+GET :8081/actuator/health
 → 200 OK {
-    "propertySources": [{
-      "properties": {
-        "spring.datasource.password": { "value": "prod_db_password_123" },
-        "notifications.auth-header-value": { "value": "webhook_secret_key" }
-      }
-    }]
+    "status": "UP",
+    "components": {
+      "db": { "status": "UP", "details": { "database": "MySQL", "validationQuery": "..." } },
+      "diskSpace": { "status": "UP", "details": { "total": 107374182400, "free": 43210 } }
+    }
   }
-
-GET /actuator/heapdump
-→ 200 OK  [binary heap dump download — extract secrets with strings or heap analysis tools]
 ```
 
-### Mitigation
+Even without `env` or `heapdump`, infrastructure topology leaks are useful for reconnaissance.
 
-**`application.yml`** — expose only health and info; disable sensitive endpoints:
+### Proposed mitigation
+
+Three complementary controls:
+
+1. Change `show-details` to `when-authorized` so health detail is only visible to authenticated ops users.
+2. Uncomment `management.server.address: 127.0.0.1` for every non-local environment.
+3. Add a `SecurityFilterChain` scoped to the management port that requires `ROLE_OPS` for all `/actuator/**` paths except `/actuator/health`.
 
 ```yaml
-management:
-  endpoints:
-    web:
-      exposure:
-        include: health,info,metrics,prometheus    # whitelist approach
-        # DO NOT use include: "*" — that exposes env, heapdump, beans, etc.
-  endpoint:
-    health:
-      show-details: when-authorized               # hide component details from anonymous
-    env:
-      enabled: false                              # never expose env
-  server:
-    port: 8081                                    # separate management port
-    address: 127.0.0.1                            # bind to localhost only (internal network)
-```
-
-**`SecurityConfig`** — additional layer to restrict management port to ops role:
-
-```java
-.authorizeHttpRequests(auth -> auth
-    .requestMatchers("/actuator/health").permitAll()
-    .requestMatchers("/actuator/**").hasRole("OPS")  // ops team only
-    .anyRequest().authenticated()
-)
-```
-
-**Defense in depth checklist:**
-
-| Control | Implementation |
-|---|---|
-| Whitelist endpoints | `management.endpoints.web.exposure.include` — explicit list only |
-| Bind to internal interface | `management.server.address=127.0.0.1` |
-| Require authentication | `hasRole("OPS")` on all `/actuator/**` except health |
-| Disable env endpoint | `management.endpoint.env.enabled=false` |
-| Mask sensitive properties | Spring Boot auto-masks `password`, `secret`, `key` in `/actuator/env` |
-| Separate port | `management.server.port=8081` — not exposed in public load balancer |
-
----
-
-## Summary
-
-| OWASP ID | Vulnerability | Mitigation |
-|---|---|---|
-| API1:2023 | BOLA — client accessing another client's data | Authorization check in use case using security context, not user input |
-| API2:2023 | Broken Authentication — unauthenticated access | Spring Security with role-based protection per endpoint zone |
-| API8:2023 | Security Misconfiguration — Actuator exposure | Whitelist-only exposure, internal port binding, OPS role required |
-
----
-
-## Implementation Notes
-
-Security is not implemented in the current codebase — the focus of this challenge is the delivery
-pipeline and the self-service API. The following would be required to harden the service for
-production:
-
-### Spring Security setup
-- Add `spring-boot-starter-security` to `pom.xml`
-- Implement `SecurityFilterChain` with STATELESS session policy
-- Define three roles: `PLATFORM` (ingest endpoints), `CLIENT` (self-service API), `OPS` (actuator)
-- Use HTTP Basic for a quick demo setup; replace with **JWT / OAuth2** (e.g., Keycloak, Auth0) in production
-
-### BOLA prevention
-- Extract `clientUniqueCode` from the `SecurityContext` in every controller method — never from a user-supplied query parameter or request body
-- The authenticated client code becomes the immutable filter for all queries to `NotificationEventRepository` and `SubscriptionRepository`
-
-### Actuator hardening
-Apply the following to `application.yml` (already in the spec):
-```yaml
+# application.yml — production-ready actuator config
 management:
   endpoints:
     web:
       exposure:
         include: health,info,metrics,prometheus
   endpoint:
+    health:
+      show-details: when-authorized   # not always
     env:
       enabled: false
   server:
-    address: 127.0.0.1
+    port: 8081
+    address: 127.0.0.1               # internal network only
 ```
+
+---
+
+## Summary
+
+| OWASP ID | Vulnerability | Attack vector | Proposed mitigation |
+|---|---|---|---|
+| API1:2023 | BOLA — client reads/replays another client's notification | Know or guess a `uniqueCode` | Ownership check against authenticated security context on every resource endpoint |
+| API2:2023 | Broken Authentication — all endpoints publicly accessible | Unauthenticated HTTP request | `SecurityFilterChain` with stateless session, role-based zones per endpoint group |
+| API8:2023 | Security Misconfiguration — Actuator health leaks infra details | Direct request to management port | `show-details: when-authorized`, bind port to `127.0.0.1`, ops-role gate on `/actuator/**` |
+
+> None of these mitigations are implemented in the current codebase — this is intentional per the challenge scope, which asks to identify and propose, not to implement. The delivery pipeline and self-service API are the implementation focus.
+
+---
+
+## Additional Observations
+
+**API7:2023 — SSRF via webhookUrl**: `POST /api/subscriptions` accepts any URL. The server makes HTTP requests to that URL during delivery, so an attacker could register `http://169.254.169.254/` (cloud metadata) or internal addresses to probe the private network. Mitigation: validate on subscription creation that the URL uses HTTPS and does not resolve to a private/loopback/link-local address.
+
+**Secrets at rest — auth_header_value**: The webhook authentication token is stored as plaintext `VARCHAR` in the `subscriptions` table. Any DB replica, backup, or log with query output exposes it. Mitigation: encrypt the column via a JPA `AttributeConverter` backed by AES-256-GCM with a KMS-managed key, or store a Vault/Secrets Manager reference and resolve the value only at delivery time.
+
+**API4:2023 — Unrestricted Resource Consumption**: `POST /api/platform-events/ingest` has no rate limit. A caller can flood the pipeline with thousands of `PENDING` notifications in seconds, degrading delivery throughput without exploiting any other vulnerability. Mitigation: per-client rate limiting at the API Gateway or via `bucket4j` in Spring.

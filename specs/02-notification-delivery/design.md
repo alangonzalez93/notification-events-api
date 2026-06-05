@@ -4,7 +4,7 @@
 
 | Component | Technology | Rationale |
 |---|---|---|
-| Async HTTP client | WebClient (spring-boot-starter-webflux) | Non-blocking I/O for webhook calls; handles thousands of concurrent requests with a small thread pool |
+| Async HTTP client | RestClient (included in spring-boot-starter-web) | Blocking HTTP client on a dedicated thread pool — simple, honest, no reactive complexity. Each webhook call runs on its own `@Async` worker thread, so blocking is intentional and correct. |
 | Distributed scheduler lock | ShedLock + JDBC provider | Guarantees the dispatcher job runs on exactly one node at a time; uses the existing MySQL DB as lock store |
 | Bean validation | spring-boot-starter-validation | `@Valid` on controller DTOs; declarative constraint checking without boilerplate |
 | Circuit breaker | Resilience4j (resilience4j-spring-boot3) | Opens circuit per client after N consecutive failures; prevents hammering a broken webhook and degrading delivery for other clients |
@@ -23,6 +23,7 @@ domain/
     NotificationEvent.java             ← record
     PlatformEvent.java                 ← record (transient input, not persisted)
     PageResult.java                    ← generic pagination wrapper (no Spring imports)
+  // SeedEvent removed — bulk seed replaced by scripts/seed_data.sql (see US-3.2)
   port/
     in/
       CreateSubscriptionUseCase.java
@@ -30,7 +31,6 @@ domain/
       UpdateSubscriptionUseCase.java
       DeleteSubscriptionUseCase.java
       IngestPlatformEventUseCase.java
-      SeedPlatformEventsUseCase.java
       GetNotificationEventsUseCase.java
       GetNotificationEventUseCase.java
       ReplayNotificationEventUseCase.java
@@ -42,6 +42,7 @@ domain/
   exception/
     ConflictException.java             ← new → HTTP 409
     ForbiddenException.java            ← new → HTTP 403
+    CircuitOpenException.java          ← new → thrown by WebhookAdapter, caught by DeliverNotificationService
 
 application/
   usecase/
@@ -50,7 +51,6 @@ application/
     UpdateSubscriptionUseCaseImpl.java
     DeleteSubscriptionUseCaseImpl.java
     IngestPlatformEventUseCaseImpl.java
-    SeedPlatformEventsUseCaseImpl.java
     GetNotificationEventsUseCaseImpl.java
     GetNotificationEventUseCaseImpl.java
     ReplayNotificationEventUseCaseImpl.java
@@ -62,11 +62,13 @@ infrastructure/
   config/
     AsyncConfig.java                   ← @EnableAsync + ThreadPoolTaskExecutor bean (reads AsyncProperties)
     SchedulerConfig.java               ← @EnableScheduling + @EnableSchedulerLock + LockProvider bean
-    WebClientConfig.java               ← WebClient bean with timeouts
+    RestClientConfig.java              ← RestClient bean with connect/read timeouts
     CircuitBreakerConfig.java          ← Resilience4j CircuitBreakerRegistry bean
-    AsyncProperties.java               ← @ConfigurationProperties("notifications.async")
-    RetryProperties.java               ← @ConfigurationProperties("notifications.retry")
-    DispatcherProperties.java          ← @ConfigurationProperties("notifications.dispatcher")
+
+application/                          ← properties records live here, not in infra, so the application layer
+  CircuitBreakerProperties.java        ←   can read them without importing infrastructure classes
+  RetryProperties.java                 ←   @ConfigurationProperties — neutral records, no Spring coupling
+  DispatcherProperties.java            ←   (hexagonal rule: app layer must not depend on infra)
   persistence/
     entity/
       SubscriptionJpaEntity.java
@@ -89,18 +91,16 @@ infrastructure/
         CreateSubscriptionRequest.java
         UpdateSubscriptionRequest.java
         IngestPlatformEventRequest.java
-        SeedPlatformEventsRequest.java
       response/
         SubscriptionResponse.java
         NotificationEventSummaryResponse.java
         NotificationEventDetailResponse.java
-        SeedResultResponse.java
     advice/
       GlobalExceptionHandler.java      ← @RestControllerAdvice
   scheduler/
     NotificationDispatcherJob.java     ← @Scheduled + @SchedulerLock
   webhook/
-    WebhookAdapter.java                ← implements WebhookPort via WebClient
+    WebhookAdapter.java                ← implements WebhookPort via RestClient
 ```
 
 ---
@@ -181,45 +181,6 @@ public record PlatformEvent(
 ) {}
 ```
 
-### `SeedEvent` record — transient input for bulk seed, never persisted
-Pure domain record — no Jackson annotations. The `"completed"`/`"failed"` → `DeliveryStatus`
-conversion happens in the DTO layer (infrastructure), not in the domain.
-```java
-public record SeedEvent(
-    String eventId,
-    EventType eventType,
-    String payload,             // mapped from DTO's "content" field
-    OffsetDateTime deliveryDate,
-    DeliveryStatus deliveryStatus,  // already converted from "completed"/"failed" by DTO mapper
-    String clientId             // "CLIENT001" — clientUniqueCode in the system
-) {}
-```
-
-The `SeedPlatformEventsRequest` DTO (infrastructure/web layer) owns the JSON-specific details:
-```java
-// infrastructure/web/dto/request/SeedPlatformEventsRequest.java
-public record SeedPlatformEventsRequest(@Valid @NotEmpty List<SeedEventRequest> events) {
-    public record SeedEventRequest(
-        @NotBlank @JsonProperty("event_id")       String eventId,
-        @NotNull  @JsonProperty("event_type")      EventType eventType,
-        @NotBlank                                  String content,
-        @NotNull  @JsonProperty("delivery_date")   OffsetDateTime deliveryDate,
-        @NotNull  @JsonProperty("delivery_status") SeedStatus deliveryStatus,
-        @NotBlank @JsonProperty("client_id")       String clientId
-    ) {
-        // Inner enum lives in the DTO — Jackson annotations belong in infrastructure
-        public enum SeedStatus {
-            @JsonProperty("completed") COMPLETED,
-            @JsonProperty("failed")    FAILED;
-
-            public DeliveryStatus toDeliveryStatus() {
-                return this == COMPLETED ? DeliveryStatus.DELIVERED : DeliveryStatus.FAILED;
-            }
-        }
-    }
-}
-```
-
 ### `PageResult<T>` — pure domain, no Spring imports
 ```java
 public record PageResult<T>(
@@ -253,6 +214,12 @@ public interface NotificationEventRepository {
     // Dispatcher: claims next batch ready for processing
     List<NotificationEvent> findPendingBatch(int limit);
     void markAllAsProcessing(List<Long> ids);
+    void resetStuckProcessing(int processingTimeoutMinutes);
+    // Called on subscription delete — prevents orphaned PENDING notifications
+    void failAllPendingForSubscription(String subscriptionUniqueCode);
+    // Direct @Modifying UPDATE — avoids SELECT+merge cycle on status changes
+    void updateStatus(String uniqueCode, DeliveryStatus status, OffsetDateTime deliveredAt,
+                      int retryCount, OffsetDateTime nextRetryAt, String lastError);
     PageResult<NotificationEvent> findByClientUniqueCode(
         String clientUniqueCode, DeliveryStatus status,
         OffsetDateTime from, OffsetDateTime to, int page, int size);
@@ -263,11 +230,13 @@ public interface NotificationEventRepository {
 ```java
 public interface WebhookPort {
     WebhookResult post(String url, String authHeaderName, String authHeaderValue,
-                       String idempotencyKey, String payload);
+                       String idempotencyKey, String clientUniqueCode, String payload);
 }
 
-public record WebhookResult(boolean success, int httpStatus, String errorMessage, Duration duration) {}
+public record WebhookResult(boolean success, int httpStatus, String errorMessage) {}
 ```
+`clientUniqueCode` is passed to the adapter so it can key the per-client circuit breaker internally.
+`duration` was removed — latency measurement is the service's responsibility, not the port contract's.
 
 ---
 
@@ -515,11 +484,13 @@ POST /api/platform-events/ingest
          │
          ├── [Tx] fetch subscription → validate still active
          │
-         ├── [no Tx] CircuitBreaker(clientUniqueCode).call → WebhookPort.post()
+         ├── [no Tx] WebhookPort.post(url, auth, idempotencyKey, clientUniqueCode, payload)
+         │           ↳ WebhookAdapter: CircuitBreaker(clientUniqueCode).call → RestClient.post()
          │           timer: notifications.webhook.duration {event_type, client_unique_code}
          │
          │   ┌─────────────────────────────────────────────────────┐
-         │   │  catch CallNotPermittedException (circuit OPEN)      │
+         │   │  catch CircuitOpenException (adapter caught          │
+         │   │  CallNotPermittedException and rethrew domain ex)    │
          │   │  → [Tx] status=PENDING                               │
          │   │         nextRetryAt=NOW()+cbWaitDuration (30s)       │
          │   │         retryCount UNCHANGED ← budget preserved      │
@@ -548,10 +519,11 @@ POST /api/platform-events/ingest
 ```java
 // baseDelay=5s, maxDelay=60s, jitterFactor=0.2
 long delaySeconds = (long) Math.min(
-    retryProperties.baseDelay() * Math.pow(2, retryCount),
-    retryProperties.maxDelay()
+    retryProperties.baseDelaySeconds() * Math.pow(2, retryCount),
+    retryProperties.maxDelaySeconds()
 );
-long jitter = (long) (Math.random() * delaySeconds * retryProperties.jitterFactor());
+// ThreadLocalRandom: lock-free per-thread RNG — correct under concurrent retry fan-out
+long jitter = (long) (ThreadLocalRandom.current().nextDouble() * delaySeconds * retryProperties.jitterFactor());
 OffsetDateTime nextRetryAt = OffsetDateTime.now(ZoneOffset.UTC).plusSeconds(delaySeconds + jitter);
 ```
 
@@ -571,7 +543,6 @@ Transaction boundaries are critical for correctness and recoverability. This sec
 |---|---|---|
 | `CreateSubscriptionUseCaseImpl` | `REQUIRED` | Existence check + save atomic |
 | `IngestPlatformEventUseCaseImpl` | `REQUIRED` | Subscription lookup + notification INSERT atomic; DB UNIQUE on `(event_id, client_id)` handles concurrent duplicates |
-| `SeedPlatformEventsUseCaseImpl` | **No outer TX** — per-event `REQUIRED` via inner `seedEventSaver` bean | One failure must not roll back others (see §Bulk seed) |
 | `ProcessPendingNotificationsUseCaseImpl` | `REQUIRED` | Recovery reset + batch claim atomic; TX commits before `@Async` dispatch |
 | `ReplayNotificationEventUseCaseImpl` | `REQUIRED` | Optimistic lock (`@Version`) prevents concurrent replays |
 | `DeliverNotificationService` | **No outer TX** | HTTP call must never hold a DB connection (see §Delivery phases) |
@@ -634,12 +605,13 @@ Since Spring proxies only intercept calls made through the proxy (not `this.meth
 
 ```java
 try {
-    WebhookResult result = webhookPort.post(url, authHeader, idempotencyKey, payload);
+    WebhookResult result = webhookPort.post(url, authHeader, idempotencyKey, clientUniqueCode, payload);
     // 2xx → DELIVERED
-} catch (CallNotPermittedException e) {
-    // Circuit breaker OPEN — HTTP call was never made
+} catch (CircuitOpenException e) {
+    // Circuit breaker OPEN — WebhookAdapter caught CallNotPermittedException and rethrew
+    // domain exception. The HTTP call was never made.
     // retryCount is NOT incremented — budget is preserved
-    // nextRetryAt = NOW() + circuitBreakerWaitDuration
+    // nextRetryAt = NOW() + e.waitDurationSeconds()
     // status = PENDING
 } catch (WebhookCallException e) {
     // Actual delivery failure (non-2xx, timeout, connection error)
@@ -673,29 +645,10 @@ The `version` column must be added to the `notification_events` migration and to
 
 ---
 
-### 4. Bulk seed — independent transaction per event
+### 4. ~~Bulk seed~~ — replaced by SQL script
 
-If the entire seed runs in one transaction and event #7 fails (duplicate `eventId`, unknown client),
-events 1–6 silently roll back.
-
-Fix: no outer `@Transactional` on `SeedPlatformEventsUseCaseImpl`. Each event is persisted via an
-inner `@Service` bean whose method is `@Transactional(propagation = REQUIRED)`, creating its own
-independent transaction. Note: seed does **not** call `IngestPlatformEventUseCaseImpl` — it creates
-`NotificationEvent` records directly in their final state (DELIVERED/FAILED):
-
-```java
-// SeedPlatformEventsUseCaseImpl — no @Transactional
-for (SeedEvent event : events) {
-    try {
-        seedEventSaver.save(event); // own TX per call — @Transactional REQUIRED
-        created++;
-    } catch (ConflictException e) {
-        discarded++; // duplicate eventId+clientId — skip silently
-    } catch (NotFoundException e) {
-        discarded++; // unknown clientId or no active subscription — skip silently
-    }
-}
-```
+> El endpoint HTTP de bulk seed fue eliminado. Ver US-3.2 en requirements.md para el razonamiento.
+> Los datos de demo se cargan con `scripts/seed_data.sql`.
 
 One failure does not affect the others.
 
@@ -732,8 +685,13 @@ public class AsyncConfig {
         executor.setMaxPoolSize(props.maxPoolSize());
         executor.setQueueCapacity(props.queueCapacity());
         executor.setThreadNamePrefix("webhook-");
-        // Caller runs when queue is full — prevents silently dropping notifications
-        executor.setRejectedExecutionHandler(new CallerRunsPolicy());
+        // Discard + log when pool and queue are both full.
+        // CallerRunsPolicy is avoided: it would block the scheduler thread and risk
+        // letting ShedLock's lockAtMostFor expire, allowing a second dispatcher to start.
+        // Discarded notifications stay PROCESSING and are reclaimed by resetStuckProcessing()
+        // on the next scheduler run — no delivery is lost, only delayed one cycle.
+        executor.setRejectedExecutionHandler((task, pool) ->
+                log.warn("Webhook executor saturated. Task discarded — will retry in next batch."));
         executor.initialize();
         return executor;
     }
@@ -771,6 +729,7 @@ public class CircuitBreakerConfig {
 @ConfigurationProperties("notifications.circuitbreaker")
 public record CircuitBreakerProperties(
     int slidingWindowSize,
+    int minimumNumberOfCalls,    // min calls before failure rate is evaluated (default 100 in Resilience4j)
     float failureRateThreshold,
     long waitDurationSeconds,
     int permittedCallsInHalfOpen
@@ -798,19 +757,19 @@ public class SchedulerConfig {
 }
 ```
 
-### `WebClientConfig`
+### `RestClientConfig`
 ```java
 @Configuration
-public class WebClientConfig {
+public class RestClientConfig {
     @Bean
-    public WebClient webhookWebClient(
-            @Value("${notifications.webhook.connect-timeout-ms:5000}") int connectTimeout,
-            @Value("${notifications.webhook.read-timeout-ms:10000}")  int readTimeout) {
-        var httpClient = HttpClient.create()
-            .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, connectTimeout)
-            .responseTimeout(Duration.ofMillis(readTimeout));
-        return WebClient.builder()
-            .clientConnector(new ReactorClientHttpConnector(httpClient))
+    public RestClient webhookRestClient(
+            @Value("${notifications.webhook.connect-timeout-ms:5000}") int connectTimeoutMs,
+            @Value("${notifications.webhook.read-timeout-ms:10000}")  int readTimeoutMs) {
+        var factory = new SimpleClientHttpRequestFactory();
+        factory.setConnectTimeout(connectTimeoutMs);
+        factory.setReadTimeout(readTimeoutMs);
+        return RestClient.builder()
+            .requestFactory(factory)
             .defaultHeader(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
             .build();
     }
@@ -854,7 +813,11 @@ public class WebClientConfig {
 
 ### Platform event ingestion
 
-#### `POST /api/platform-events/ingest`
+#### `POST /api/platform-events`
+
+> En producción este endpoint sería reemplazado por un listener SQS/Pub/Sub/Kafka.
+> Existe como HTTP solo para demo/evaluación. Ver comentario en `PlatformEventController.java`.
+
 ```json
 // Request
 {
@@ -863,40 +826,12 @@ public class WebClientConfig {
   "payload":          "Bank transfer received for $1,500.00",
   "clientUniqueCode": "client-uuid"
 }
-// Response 201 — notification created
+// Response 201 — notification created and queued for delivery
 { "notificationUniqueCode": "uuid", "deliveryStatus": "pending" }
 
-// Response 202 — no matching subscription, event discarded
-```
-
-#### `POST /api/platform-events`
-Accepts the `notification_events.json` format directly. Creates notification events in their final
-state (DELIVERED or FAILED) — bypasses the delivery pipeline. The company-provided JSON is the
-canonical input format for this endpoint.
-
-Mapping rules:
-- `delivery_status: "completed"` → `DeliveryStatus.DELIVERED`, `deliveredAt = delivery_date`
-- `delivery_status: "failed"` → `DeliveryStatus.FAILED`
-- `subscription_id`: resolved by looking up any active subscription for the client; event is
-  discarded (counted in `discarded`) if no active subscription exists for that client
-- Duplicate `event_id` per client → discarded
-
-```json
-// Request — matches notification_events.json exactly
-{
-  "events": [
-    {
-      "event_id":        "EVT001",
-      "event_type":      "credit_card_payment",
-      "content":         "Credit card payment received for $150.00",
-      "delivery_date":   "2024-03-15T09:30:22Z",
-      "delivery_status": "completed",
-      "client_id":       "CLIENT001"
-    }
-  ]
-}
-// Response 200
-{ "created": 7, "discarded": 3 }
+// Response 202 — no matching subscription, event silently discarded
+// Response 409 — duplicate eventId, already processed
+// Response 400 — eventType is not a valid EventType value
 ```
 
 ---
@@ -982,11 +917,12 @@ management:
         include: health,info,metrics,prometheus   # whitelist — never use "*"
   endpoint:
     health:
-      show-details: when-authorized
+      show-details: always            # dev/demo — use when-authorized in production
     env:
       enabled: false                  # never expose env vars via actuator
   server:
-    address: 127.0.0.1               # bind management port to localhost only
+    port: 8081
+    # address: 127.0.0.1             # descomentar en producción para restringir a red interna
 ```
 
 ---
@@ -1000,6 +936,7 @@ management:
 | `ForbiddenException` | 403 Forbidden |
 | `MethodArgumentNotValidException` | 400 Bad Request (field-level errors) |
 | `HttpMessageNotReadableException` | 400 Bad Request (invalid JSON / unknown enum) |
+| `DataIntegrityViolationException` | 409 Conflict (concurrent duplicate insert hits DB unique constraint) |
 | Unhandled `Exception` | 500 Internal Server Error |
 
 Consistent error envelope:
