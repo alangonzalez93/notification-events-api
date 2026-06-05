@@ -1,6 +1,6 @@
 package com.cobre.notifications.domain.model;
 
-import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 
 public record Client(
         Long id,
@@ -8,6 +8,6 @@ public record Client(
         String name,
         String email,
         Boolean deleted,
-        LocalDateTime createdDate,
-        LocalDateTime lastModifiedDate
+        OffsetDateTime createdDate,
+        OffsetDateTime lastModifiedDate
 ) {}
